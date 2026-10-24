@@ -37,6 +37,7 @@
 	let dynamics: DynamicListItem[] = [];
 	let dynamicPage = 0;
 	let dynamicTotalCount = 0;
+	let showDeletedOnly = false;
 	const dynamicPageSize = 20;
 	let loading = false;
 	let rescanningAll = false;
@@ -126,7 +127,12 @@
 		try {
 			const [statsResponse, dynamicsResponse] = await Promise.all([
 				api.getDynamicSourceStats(target),
-				api.getDynamicSourceDynamics(target, dynamicPage, dynamicPageSize)
+				api.getDynamicSourceDynamics(
+					target,
+					dynamicPage,
+					dynamicPageSize,
+					showDeletedOnly ? false : undefined
+				)
 			]);
 			if (current !== dataSequence) return;
 			stats = statsResponse.data;
@@ -150,7 +156,12 @@
 		dynamicPage = nextPage;
 		loading = true;
 		try {
-			const response = await api.getDynamicSourceDynamics(sourceId, nextPage, dynamicPageSize);
+			const response = await api.getDynamicSourceDynamics(
+				sourceId,
+				nextPage,
+				dynamicPageSize,
+				showDeletedOnly ? false : undefined
+			);
 			if (current !== dataSequence) return;
 			dynamics = response.data.dynamics;
 			dynamicTotalCount = response.data.totalCount;
@@ -162,6 +173,12 @@
 		} finally {
 			if (current === dataSequence) loading = false;
 		}
+	}
+
+	async function setDeletedFilter(deletedOnly: boolean) {
+		if (showDeletedOnly === deletedOnly) return;
+		showDeletedOnly = deletedOnly;
+		await loadDynamicPage(0);
 	}
 
 	async function scanProfileNow() {
@@ -264,6 +281,7 @@
 			dynamics = [];
 			dynamicPage = 0;
 			dynamicTotalCount = 0;
+			showDeletedOnly = false;
 			showDetailDialog = false;
 			lastDetailTarget = '';
 			setBreadcrumb([{ label: '动态源', href: '/dynamic-sources' }, { label: '动态源详情' }]);
@@ -469,6 +487,19 @@
 					>
 				</div>
 				<div class="flex items-center gap-2">
+					<div class="flex items-center rounded-md border p-0.5">
+						<Button
+							size="sm"
+							variant={showDeletedOnly ? 'ghost' : 'secondary'}
+							onclick={() => setDeletedFilter(false)}
+							class="h-7 px-2 text-xs">全部</Button
+						><Button
+							size="sm"
+							variant={showDeletedOnly ? 'secondary' : 'ghost'}
+							onclick={() => setDeletedFilter(true)}
+							class="h-7 px-2 text-xs">只看已删除</Button
+						>
+					</div>
 					<Button
 						size="sm"
 						variant="outline"
@@ -601,7 +632,11 @@
 					onPageChange={loadDynamicPage}
 				/>
 			{:else}
-				<div class="text-muted-foreground py-8 text-center text-sm">暂无动态</div>
+				<div class="text-muted-foreground py-8 text-center text-sm">
+					{showDeletedOnly
+						? '\u6682\u65e0\u5df2\u5220\u9664\u52a8\u6001'
+						: '\u6682\u65e0\u52a8\u6001'}
+				</div>
 			{/if}
 		</div>
 	{:else}

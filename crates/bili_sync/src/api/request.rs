@@ -158,6 +158,7 @@ pub struct InsertDynamicSourceRequest {
 pub struct DynamicSourcesRequest {
     pub page: Option<u64>,
     pub page_size: Option<u64>,
+    pub valid: Option<bool>,
 }
 
 #[derive(Deserialize, Validate)]

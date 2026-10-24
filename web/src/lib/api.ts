@@ -224,11 +224,13 @@ class ApiClient {
 	async getDynamicSourceDynamics(
 		id: number,
 		page = 0,
-		pageSize = 20
+		pageSize = 20,
+		valid?: boolean
 	): Promise<ApiResponse<DynamicDynamicsResponse>> {
 		return this.get<DynamicDynamicsResponse>(`/dynamic-sources/${id}/dynamics`, {
 			page,
-			page_size: pageSize
+			page_size: pageSize,
+			valid
 		});
 	}
 
@@ -439,8 +441,8 @@ const api = {
 		apiClient.updateDynamicSource(id, request),
 	removeDynamicSource: (id: number) => apiClient.removeDynamicSource(id),
 	getDynamicSourceStats: (id: number) => apiClient.getDynamicSourceStats(id),
-	getDynamicSourceDynamics: (id: number, page?: number, pageSize?: number) =>
-		apiClient.getDynamicSourceDynamics(id, page, pageSize),
+	getDynamicSourceDynamics: (id: number, page?: number, pageSize?: number, valid?: boolean) =>
+		apiClient.getDynamicSourceDynamics(id, page, pageSize, valid),
 	rescanAllReplies: (id: number) => apiClient.rescanAllReplies(id),
 	rescanSingleReply: (id: number, dynId: string) => apiClient.rescanSingleReply(id, dynId),
 	scanProfile: (id: number) => apiClient.scanProfile(id),

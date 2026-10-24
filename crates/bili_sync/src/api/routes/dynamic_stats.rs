@@ -169,9 +169,11 @@ pub async fn get_dynamic_source_dynamics(
     };
     let page = params.page.unwrap_or(0);
     let page_size = params.page_size.unwrap_or(20).clamp(1, 100);
-    let query = dynamic::Entity::find()
-        .filter(dynamic::Column::SourceId.eq(source.id))
-        .order_by_desc(dynamic::Column::PubTs);
+    let mut query = dynamic::Entity::find().filter(dynamic::Column::SourceId.eq(source.id));
+    if let Some(valid) = params.valid {
+        query = query.filter(dynamic::Column::Valid.eq(valid));
+    }
+    let query = query.order_by_desc(dynamic::Column::PubTs);
     let total_count = query.clone().count(&db).await?;
     let dynamics = query.paginate(&db, page_size).fetch_page(page).await?;
     let dynamic_ids = dynamics.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
@@ -512,6 +514,67 @@ mod tests {
         assert_eq!(replies[0]["subReplies"][0]["subReplies"][0]["rpid"], 3);
         assert_eq!(replies[1]["rpid"], 4);
         assert_eq!(replies[1]["parentRpid"], 999);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_list_filters_deleted_only_and_keeps_filtered_total() -> Result<()> {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).sqlx_logging(false);
+        let db = Database::connect(options).await?;
+        Migrator::up(&db, None).await?;
+        let now = chrono::Utc::now().naive_utc();
+        dynamic_source::ActiveModel {
+            id: Set(1_000_002),
+            upper_id: Set(123),
+            upper_name: Set("test".into()),
+            path: Set(String::new()),
+            created_at: Set(now),
+            latest_dyn_at: Set(now),
+            sync_reply: Set(true),
+            enabled: Set(true),
+        }
+        .insert(&db)
+        .await?;
+        for (id, valid, pub_ts) in [
+            ("valid-dynamic", true, now),
+            ("deleted-dynamic", false, now + chrono::Duration::seconds(1)),
+        ] {
+            dynamic::ActiveModel {
+                id: Set(id.into()),
+                source_id: Set(1_000_002),
+                dyn_type: Set("DYNAMIC_TYPE_DRAW".into()),
+                content: Set(String::new()),
+                pub_ts: Set(pub_ts),
+                comment_type: Set(0),
+                comment_oid: Set(String::new()),
+                location: Set(String::new()),
+                download_status: Set(0),
+                path: Set(String::new()),
+                valid: Set(valid),
+                rescan_reply: Set(false),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+        let response = get_dynamic_source_dynamics(
+            Path(1_000_002),
+            Query(DynamicSourcesRequest {
+                page: Some(0),
+                page_size: Some(20),
+                valid: Some(false),
+            }),
+            Extension(db),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("dynamic list request failed"))?;
+        let body = serde_json::to_value(response)?;
+        assert_eq!(body["data"]["totalCount"], 1);
+        let dynamics = body["data"]["dynamics"].as_array().unwrap();
+        assert_eq!(dynamics.len(), 1);
+        assert_eq!(dynamics[0]["id"], "deleted-dynamic");
+        assert_eq!(dynamics[0]["valid"], false);
         Ok(())
     }
 }
