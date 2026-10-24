@@ -22,12 +22,15 @@ use crate::api::response::{
 use crate::api::wrapper::{ApiError, ApiResponse};
 use crate::bilibili::BiliClient;
 use crate::config::VersionedConfig;
-use crate::workflow_dynamic::{process_dynamic_source_queued, scan_profile_queued};
+use crate::workflow_dynamic::{
+    get_source_lock, process_dynamic_source_queued, scan_deleted_dynamics_for_source, scan_profile_queued,
+};
 
 pub(super) fn router() -> Router {
     Router::new()
         .route("/dynamic-sources/{id}/stats", get(get_dynamic_source_stats))
         .route("/dynamic-sources/{id}/scan-profile", post(scan_profile))
+        .route("/dynamic-sources/{id}/scan-deleted", post(scan_deleted_dynamics))
         .route("/dynamic-sources/{id}/sync-now", post(sync_now))
         .route("/dynamic-sources/{id}/dynamics", get(get_dynamic_source_dynamics))
         .route(
@@ -289,6 +292,31 @@ pub async fn sync_now(
         match process_dynamic_source_queued(id, &bili_client, &connection, &config).await {
             Ok(()) => info!("手动触发的动态同步完成"),
             Err(e) => error!("手动触发的动态同步失败：{:#}", e),
+        }
+    });
+    Ok(ApiResponse::ok(true))
+}
+
+/// 手动检查该动态源下已删除的动态，不影响本地文件。
+/// 提交后立即返回，后台全量比对动态列表，结果见日志页和动态列表状态。
+pub async fn scan_deleted_dynamics(
+    Path(id): Path<i32>,
+    Extension(db): Extension<DatabaseConnection>,
+    Extension(bili_client): Extension<Arc<BiliClient>>,
+) -> Result<ApiResponse<bool>, ApiError> {
+    let Some(_) = dynamic_source::Entity::find_by_id(id).one(&db).await? else {
+        return Err(InnerApiError::NotFound(id).into());
+    };
+    let guard = get_source_lock(id)
+        .try_lock_owned()
+        .map_err(|_| InnerApiError::BadRequest("该动态源正在同步或检查中，请待本轮完成后重试".to_string()))?;
+    let connection = db.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let config = VersionedConfig::get().snapshot();
+        match scan_deleted_dynamics_for_source(id, &bili_client, &connection, &config).await {
+            Ok(()) => info!("手动触发的动态删除检查完成"),
+            Err(e) => error!("手动触发的动态删除检查失败：{:#}", e),
         }
     });
     Ok(ApiResponse::ok(true))

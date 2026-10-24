@@ -41,6 +41,7 @@
 	let loading = false;
 	let rescanningAll = false;
 	let scanningProfile = false;
+	let scanningDeleted = false;
 	let syncingNow = false;
 	let showSyncWarningDialog = false;
 	let rescanningIds = new SvelteSet<string>();
@@ -177,6 +178,23 @@
 			});
 		} finally {
 			scanningProfile = false;
+		}
+	}
+
+	async function scanDeletedNow() {
+		scanningDeleted = true;
+		try {
+			await api.scanDeletedDynamics(sourceId);
+			toast.success('已开始检查', {
+				description:
+					'后台将拉取该 UP 的全部动态并比对；被删除的动态会标记为「已删除（本地保留）」，完成后刷新列表查看，进度见任务看板'
+			});
+		} catch (error) {
+			toast.error('检查失败', {
+				description: (error as ApiError).message
+			});
+		} finally {
+			scanningDeleted = false;
 		}
 	}
 
@@ -450,16 +468,28 @@
 						>1 天内每小时，2–7 天每 6 小时，8–30 天每 24 小时</span
 					>
 				</div>
-				<Button
-					size="sm"
-					variant="outline"
-					onclick={rescanAll}
-					disabled={rescanningAll}
-					class="flex items-center gap-2"
-				>
-					<RefreshCwIcon class="h-3.5 w-3.5" />
-					{rescanningAll ? '标记中...' : '全部重扫评论'}
-				</Button>
+				<div class="flex items-center gap-2">
+					<Button
+						size="sm"
+						variant="outline"
+						onclick={scanDeletedNow}
+						disabled={scanningDeleted}
+						class="flex items-center gap-2"
+					>
+						<ScanSearchIcon class="h-3.5 w-3.5" />
+						{scanningDeleted ? '触发中...' : '检查动态删除'}
+					</Button>
+					<Button
+						size="sm"
+						variant="outline"
+						onclick={rescanAll}
+						disabled={rescanningAll}
+						class="flex items-center gap-2"
+					>
+						<RefreshCwIcon class="h-3.5 w-3.5" />
+						{rescanningAll ? '标记中...' : '全部重扫评论'}
+					</Button>
+				</div>
 			</div>
 			{#if dynamics.length > 0}
 				<div class="overflow-x-auto">

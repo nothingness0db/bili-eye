@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use anyhow::{Context, Result, anyhow};
 use async_stream::try_stream;
 use chrono::{DateTime, Utc};
@@ -6,7 +8,7 @@ use reqwest::Method;
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
 
-use crate::bilibili::{BiliClient, Credential, ErrorForStatusExt, MIXIN_KEY, Validate, VideoInfo, WbiSign};
+use crate::bilibili::{BiliClient, BiliError, Credential, ErrorForStatusExt, MIXIN_KEY, Validate, VideoInfo, WbiSign};
 
 /// 动态列表接口请求间隔，与视频接口节奏对齐（全局限流器 250ms/4 之上再加 250ms）
 const DYNAMIC_FEED_INTERVAL: Duration = Duration::from_millis(250);
@@ -100,6 +102,20 @@ impl<'a> Dynamic<'a> {
     }
 }
 
+/// 动态列表中的轻量条目，仅用于比对删除状态
+#[derive(Debug, Clone)]
+pub struct DynamicStub {
+    pub id: String,
+}
+
+/// 单条动态详情接口的探测结果
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicExistence {
+    Exists,
+    Gone,
+    Unknown,
+}
+
 /// 一条完整动态的信息，包含动态下的所有内容
 #[derive(Debug, Clone)]
 pub struct DynamicInfo {
@@ -167,6 +183,42 @@ impl<'a> DynamicFeed<'a> {
             .validate()
     }
 
+    /// 拉取当前全部动态的 id，不解析正文；任何一页失败都会放弃整轮结果。
+    pub async fn list_all(&self) -> Result<Vec<DynamicStub>> {
+        let mut offset = None;
+        let mut seen_offsets = HashSet::new();
+        let mut stubs = Vec::new();
+        loop {
+            let current_offset = offset.take();
+            sleep(DYNAMIC_FEED_INTERVAL).await;
+            let res = self.get_dynamics(current_offset.clone()).await?;
+            let items = match res["data"]["items"].as_array() {
+                Some(items) if !items.is_empty() => items,
+                _ if current_offset.is_none() => break,
+                _ => Err(anyhow!("no dynamics found in offset {:?}", current_offset))?,
+            };
+            for item in items {
+                let Some(id) = item["id_str"].as_str() else { continue };
+                stubs.push(DynamicStub { id: id.to_string() });
+            }
+            if let (Some(has_more), Some(new_offset)) =
+                (res["data"]["has_more"].as_bool(), res["data"]["offset"].as_str())
+            {
+                if !has_more {
+                    break;
+                }
+                // Reject a repeated offset so an incomplete feed never causes false deletion.
+                if !seen_offsets.insert(new_offset.to_string()) {
+                    return Err(anyhow::Error::msg("dynamic feed returned a repeated offset"));
+                }
+                offset = Some(new_offset.to_string());
+            } else {
+                Err(anyhow!("no has_more or offset found"))?;
+            }
+        }
+        Ok(stubs)
+    }
+
     pub fn into_dynamic_stream(self) -> impl Stream<Item = Result<DynamicInfo>> + 'a {
         try_stream! {
             let mut offset = None;
@@ -201,6 +253,54 @@ impl<'a> DynamicFeed<'a> {
                     Err(anyhow!("no has_more or offset found"))?;
                 }
             }
+        }
+    }
+}
+
+/// 单条动态详情探测，用于确认列表缺失的动态是已删除还是分页遗漏
+pub struct DynamicDetail<'a> {
+    client: &'a BiliClient,
+    credential: &'a Credential,
+}
+
+impl<'a> DynamicDetail<'a> {
+    pub fn new(client: &'a BiliClient, credential: &'a Credential) -> Self {
+        Self { client, credential }
+    }
+
+    pub async fn check(&self, id: &str) -> Result<DynamicExistence> {
+        let res = self
+            .client
+            .request(
+                Method::GET,
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/detail",
+                self.credential,
+            )
+            .await
+            .query(&[
+                ("id", id),
+                ("timezone_offset", "-480"),
+                ("platform", "web"),
+                (
+                    "features",
+                    "itemOpusStyle,opusBigCover,onlyfansVote,endFooterHidden,decorationCard,onlyfansAssetsV2,ugcDelete,onlyfansQaCard,commentsNewVersion",
+                ),
+                ("web_location", "333.1368"),
+            ])
+            .wbi_sign(MIXIN_KEY.load().as_deref())?
+            .send()
+            .await?
+            .error_for_status_ext()?
+            .json::<Value>()
+            .await?;
+        let code = res["code"]
+            .as_i64()
+            .with_context(|| BiliError::InvalidResponse(res.to_string()))?;
+        match code {
+            0 if res["data"]["item"].is_object() => Ok(DynamicExistence::Exists),
+            4101105 | -404 => Ok(DynamicExistence::Gone),
+            -352 | -412 | -403 => Err(BiliError::RiskControlOccurred(res.to_string()).into()),
+            _ => Ok(DynamicExistence::Unknown),
         }
     }
 }

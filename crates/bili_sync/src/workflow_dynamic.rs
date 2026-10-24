@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex as StdMutex};
 use std::time::Instant;
@@ -9,13 +9,13 @@ use futures::{StreamExt, stream};
 use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::{Condition, OnConflict};
-use sea_orm::{ConnectionTrait, QueryOrder, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, QueryOrder, QuerySelect, Statement, TransactionTrait};
 use serde_json::Value;
 use tokio::fs;
 
 use crate::bilibili::{
-    BiliClient, BiliError, DynamicFeed, DynamicInfo, MIXIN_KEY, Reply, ReplyInfo, ReplySyncState, Submission,
-    UpperInfo, VideoInfo,
+    BiliClient, BiliError, DynamicDetail, DynamicExistence, DynamicFeed, DynamicInfo, MIXIN_KEY, Reply, ReplyInfo,
+    ReplySyncState, Submission, UpperInfo, VideoInfo,
 };
 use crate::config::Config;
 use crate::downloader::Downloader;
@@ -665,6 +665,158 @@ async fn refresh_dynamic_source(
         model.update(connection).await?;
     }
     info!("扫描「{}」动态完成，获取到 {} 条新动态", source.upper_name, count);
+    Ok(())
+}
+
+#[derive(FromQueryResult)]
+struct DynamicScanRow {
+    id: String,
+    valid: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DeletionScanPlan {
+    /// 动态重新出现在列表里，需要恢复有效状态
+    restore: Vec<String>,
+    /// 列表缺失，需要通过详情接口确认是否已删除
+    verify: Vec<String>,
+}
+
+fn plan_deletion_scan(rows: &[DynamicScanRow], current: &HashSet<String>) -> DeletionScanPlan {
+    let mut plan = DeletionScanPlan::default();
+    for row in rows {
+        if current.contains(&row.id) {
+            if !row.valid {
+                plan.restore.push(row.id.clone());
+            }
+        } else if row.valid {
+            plan.verify.push(row.id.clone());
+        }
+    }
+    plan
+}
+
+/// 手动检查某个动态源的动态删除情况，保留本地文件与评论。
+/// 调用方必须持有该动态源的锁，避免与同步任务并发。
+pub async fn scan_deleted_dynamics_for_source(
+    source_id: i32,
+    bili_client: &BiliClient,
+    connection: &DatabaseConnection,
+    config: &Config,
+) -> Result<()> {
+    ensure_mixin_key(bili_client, &config.credential).await?;
+    let source = dynamic_source::Entity::find_by_id(source_id)
+        .one(connection)
+        .await?
+        .with_context(|| format!("dynamic source {source_id} no longer exists"))?;
+    let _progress_guard = SyncProgressGuard { source_id };
+    set_sync_progress(
+        source.id,
+        SyncProgress {
+            source_name: source.upper_name.clone(),
+            phase: "检查动态删除".into(),
+            ..Default::default()
+        },
+    );
+    let feed = DynamicFeed::new(bili_client, source.upper_id.to_string(), &config.credential);
+    let stubs = feed.list_all().await.context("获取动态列表失败，已取消删除检查")?;
+    let current: HashSet<String> = stubs.into_iter().map(|stub| stub.id).collect();
+    let rows = dynamic::Entity::find()
+        .filter(dynamic::Column::SourceId.eq(source.id))
+        .select_only()
+        .column(dynamic::Column::Id)
+        .column(dynamic::Column::Valid)
+        .into_model::<DynamicScanRow>()
+        .all(connection)
+        .await?;
+    let plan = plan_deletion_scan(&rows, &current);
+    let total = plan.restore.len() + plan.verify.len();
+    set_sync_progress(
+        source.id,
+        SyncProgress {
+            source_name: source.upper_name.clone(),
+            phase: "检查动态删除".into(),
+            current: 0,
+            total,
+            ..Default::default()
+        },
+    );
+
+    let mut deleted_ids = Vec::new();
+    let mut unconfirmed = 0;
+    if !plan.verify.is_empty() {
+        let Some(control_id) = current.iter().next() else {
+            bail!("动态列表为空，无法确认删除状态，本轮未标记任何动态");
+        };
+        // 先用一条确定存在的动态确认详情接口可用，避免接口整体异常时误判。
+        let detail = DynamicDetail::new(bili_client, &config.credential);
+        match detail.check(control_id).await? {
+            DynamicExistence::Exists => {}
+            DynamicExistence::Gone | DynamicExistence::Unknown => {
+                bail!("动态详情接口暂时不可用，本轮未标记任何动态");
+            }
+        }
+        for (idx, id) in plan.verify.iter().enumerate() {
+            let first = detail.check(id).await?;
+            // 缺失后仍被详情接口确认存在的动态可能是分页遗漏，保持原状态。
+            match first {
+                DynamicExistence::Exists => {}
+                DynamicExistence::Unknown => unconfirmed += 1,
+                DynamicExistence::Gone => {
+                    // 删除是永久状态，再确认一次，避免偶发错误码把本地档案误标为已删除。
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    match detail.check(id).await? {
+                        DynamicExistence::Gone => deleted_ids.push(id.clone()),
+                        DynamicExistence::Exists => {}
+                        DynamicExistence::Unknown => unconfirmed += 1,
+                    }
+                }
+            }
+            set_sync_progress(
+                source.id,
+                SyncProgress {
+                    source_name: source.upper_name.clone(),
+                    phase: "检查动态删除".into(),
+                    current: plan.restore.len() + idx + 1,
+                    total,
+                    ..Default::default()
+                },
+            );
+            if idx + 1 < plan.verify.len() {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+    }
+
+    let restored_count = plan.restore.len();
+    let deleted_count = deleted_ids.len();
+    let txn = connection.begin().await?;
+    if !plan.restore.is_empty() {
+        dynamic::Entity::update_many()
+            .filter(dynamic::Column::Id.is_in(plan.restore))
+            .col_expr(dynamic::Column::Valid, Expr::value(true))
+            .exec(&txn)
+            .await?;
+    }
+    if !deleted_ids.is_empty() {
+        dynamic::Entity::update_many()
+            .filter(dynamic::Column::Id.is_in(deleted_ids))
+            .col_expr(dynamic::Column::Valid, Expr::value(false))
+            .col_expr(dynamic::Column::RescanReply, Expr::value(false))
+            .col_expr(dynamic::Column::ReplySyncState, Expr::value(Option::<Value>::None))
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    info!(
+        "「{}」动态删除检查完成：本地 {} 条，当前列表 {} 条，新标记删除 {} 条，恢复 {} 条，未确认 {} 条",
+        source.upper_name,
+        rows.len(),
+        current.len(),
+        deleted_count,
+        restored_count,
+        unconfirmed
+    );
     Ok(())
 }
 
@@ -1458,6 +1610,32 @@ mod tests {
             vec!["5", "6", "7"]
         );
         assert_eq!(batch.len(), 25);
+    }
+
+    #[test]
+    fn deletion_scan_only_verifies_missing_valid_and_restores_reappeared() {
+        let rows = vec![
+            DynamicScanRow {
+                id: "present-valid".into(),
+                valid: true,
+            },
+            DynamicScanRow {
+                id: "present-invalid".into(),
+                valid: false,
+            },
+            DynamicScanRow {
+                id: "missing-valid".into(),
+                valid: true,
+            },
+            DynamicScanRow {
+                id: "missing-invalid".into(),
+                valid: false,
+            },
+        ];
+        let current = HashSet::from(["present-valid".to_string(), "present-invalid".to_string()]);
+        let plan = plan_deletion_scan(&rows, &current);
+        assert_eq!(plan.restore, vec!["present-invalid"]);
+        assert_eq!(plan.verify, vec!["missing-valid"]);
     }
 
     #[tokio::test]
