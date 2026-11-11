@@ -195,7 +195,7 @@ pub async fn update_videos_model(videos: Vec<video::ActiveModel>, connection: &D
     video::Entity::insert_many(videos)
         .on_conflict(
             OnConflict::column(video::Column::Id)
-                .update_columns([video::Column::DownloadStatus, video::Column::Path])
+                .update_columns([video::Column::DownloadStatus, video::Column::Path, video::Column::Tags])
                 .to_owned(),
         )
         .exec(connection)

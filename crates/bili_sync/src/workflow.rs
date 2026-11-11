@@ -672,7 +672,6 @@ pub async fn download_video_pages(
         }
     }
     let mut video_active_model: video::ActiveModel = video_model.into();
-    video_active_model.tags.reset();
     video_active_model.download_status = Set(status.into());
     video_active_model.path = Set(base_path.to_string_lossy().to_string());
     Ok(video_active_model)
@@ -1219,6 +1218,23 @@ mod tests {
                 .latest_row_at,
             Utc.timestamp_opt(1_750_000_000, 0).unwrap().naive_utc()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_videos_model_persists_refetched_tags() -> Result<()> {
+        let (connection, source) = source_database().await?;
+        create_videos(vec![collection_video("BVtags", 1_750_000_000)], &source, &connection).await?;
+        let mut video = video::Entity::find()
+            .one(&connection)
+            .await?
+            .unwrap()
+            .into_active_model();
+        video.tags = Set(Some(vec!["tag".to_owned()].into()));
+        video.download_status = Set(VideoStatus::from([7, 7, 7, 7, 0]).into());
+        update_videos_model(vec![video], &connection).await?;
+        let video = video::Entity::find().one(&connection).await?.unwrap();
+        assert_eq!(video.tags, Some(vec!["tag".to_owned()].into()));
         Ok(())
     }
 
