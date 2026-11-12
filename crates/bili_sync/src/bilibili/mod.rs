@@ -8,7 +8,7 @@ use bili_sync_entity::upper_vec::Upper;
 use chrono::serde::ts_seconds;
 use chrono::{DateTime, Utc};
 pub use client::{BiliClient, Client};
-pub use collection::{Collection, CollectionItem, CollectionType};
+pub use collection::{Collection, CollectionInfo, CollectionItem, CollectionType};
 pub use credential::{Credential, PollStatus, Qrcode};
 pub use danmaku::DanmakuOption;
 pub use dynamic::{Dynamic, DynamicDetail, DynamicExistence, DynamicFeed, DynamicInfo};

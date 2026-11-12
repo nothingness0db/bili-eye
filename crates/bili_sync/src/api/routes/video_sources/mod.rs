@@ -18,15 +18,15 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QuerySelect, QueryTr
 use crate::adapter::{_ActiveModel, VideoSource as _, VideoSourceEnum};
 use crate::api::error::InnerApiError;
 use crate::api::request::{
-    DefaultPathRequest, FullSyncVideoSourceRequest, InsertCollectionRequest, InsertFavoriteRequest,
-    InsertSubmissionRequest, UpdateVideoSourceRequest,
+    DefaultPathRequest, FullSyncVideoSourceRequest, InsertCollectionRequest, InsertCollectionsRequest,
+    InsertFavoriteRequest, InsertSubmissionRequest, ScanUpperCollectionsRequest, UpdateVideoSourceRequest,
 };
 use crate::api::response::{
-    FullSyncVideoSourceResponse, UpdateVideoSourceResponse, VideoSource, VideoSourceDetail,
-    VideoSourcesDetailsResponse, VideoSourcesResponse,
+    FullSyncVideoSourceResponse, InsertCollectionsResponse, ScannedCollection, ScannedCollectionsResponse,
+    UpdateVideoSourceResponse, VideoSource, VideoSourceDetail, VideoSourcesDetailsResponse, VideoSourcesResponse,
 };
 use crate::api::wrapper::{ApiError, ApiResponse, ValidatedJson};
-use crate::bilibili::{BiliClient, Collection, CollectionItem, FavoriteList, Submission};
+use crate::bilibili::{BiliClient, Collection, CollectionInfo, CollectionItem, FavoriteList, Submission};
 use crate::config::{PathSafeTemplate, TEMPLATE, VersionedConfig};
 use crate::task::DownloadTaskManager;
 use crate::utils::rule::FieldEvaluatable;
@@ -47,6 +47,8 @@ pub(super) fn router() -> Router {
         .route("/video-sources/{type}/{id}/full-sync", post(full_sync_video_source))
         .route("/video-sources/favorites", post(insert_favorite))
         .route("/video-sources/collections", post(insert_collection))
+        .route("/video-sources/collections/batch", post(insert_collections))
+        .route("/video-sources/collections/scan", post(scan_upper_collections))
         .route("/video-sources/submissions", post(insert_submission))
 }
 
@@ -512,6 +514,111 @@ pub async fn insert_collection(
     .await?;
 
     Ok(ApiResponse::ok(true))
+}
+
+/// 扫描 UP 主名下的全部合集与列表，标记其中已订阅的条目
+pub async fn scan_upper_collections(
+    Extension(db): Extension<DatabaseConnection>,
+    Extension(bili_client): Extension<Arc<BiliClient>>,
+    Json(request): Json<ScanUpperCollectionsRequest>,
+) -> Result<ApiResponse<ScannedCollectionsResponse>, ApiError> {
+    let credential = &VersionedConfig::get().read().credential;
+    let found = Collection::list_by_upper(bili_client.as_ref(), credential, &request.upper_id.to_string()).await?;
+    let sids = found.iter().map(|c| c.sid).collect::<Vec<_>>();
+    let subscribed: HashSet<i64> = if sids.is_empty() {
+        HashSet::new()
+    } else {
+        collection::Entity::find()
+            .select_only()
+            .column(collection::Column::SId)
+            .filter(collection::Column::SId.is_in(sids))
+            .filter(collection::Column::MId.eq(request.upper_id))
+            .into_tuple()
+            .all(&db)
+            .await?
+            .into_iter()
+            .collect()
+    };
+    let collections = found
+        .into_iter()
+        .map(|c| ScannedCollection {
+            sid: c.sid,
+            collection_type: i32::from(c.collection_type),
+            name: c.name,
+            cover: c.cover,
+            total: c.total,
+            subscribed: subscribed.contains(&c.sid),
+        })
+        .collect();
+    Ok(ApiResponse::ok(ScannedCollectionsResponse { collections }))
+}
+
+/// 批量订阅扫描出来的合集，已存在的条目直接跳过
+pub async fn insert_collections(
+    Extension(db): Extension<DatabaseConnection>,
+    Extension(bili_client): Extension<Arc<BiliClient>>,
+    ValidatedJson(request): ValidatedJson<InsertCollectionsRequest>,
+) -> Result<ApiResponse<InsertCollectionsResponse>, ApiError> {
+    if request.items.is_empty() {
+        return Err(InnerApiError::BadRequest("请至少选择一个合集".to_string()).into());
+    }
+    let credential = &VersionedConfig::get().read().credential;
+    let existing = collection::Entity::find()
+        .select_only()
+        .column(collection::Column::SId)
+        .filter(collection::Column::MId.eq(request.mid))
+        .into_tuple::<i64>()
+        .all(&db)
+        .await?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let (mut inserted, mut skipped) = (0usize, 0usize);
+    let mut seen = HashSet::new();
+    // 先全部确认无误再落库，避免中途失败留下半批合集
+    let mut to_insert = Vec::new();
+    for item in request.items {
+        if existing.contains(&item.sid) || !seen.insert(item.sid) {
+            skipped += 1;
+            continue;
+        }
+        let collection = Collection::new(
+            bili_client.as_ref(),
+            CollectionItem {
+                sid: item.sid.to_string(),
+                mid: request.mid.to_string(),
+                collection_type: item.collection_type,
+            },
+            credential,
+        );
+        let info = collection.get_info().await?;
+        ensure_matching_upper(&info, request.mid)?;
+        to_insert.push(collection::ActiveModel {
+            s_id: Set(info.sid),
+            m_id: Set(info.mid),
+            r#type: Set(info.collection_type.into()),
+            name: Set(info.name.clone()),
+            path: Set(request.path.clone()),
+            enabled: Set(false),
+            ..Default::default()
+        });
+    }
+    if !to_insert.is_empty() {
+        let txn = db.begin().await?;
+        for model in to_insert {
+            model.insert(&txn).await?;
+            inserted += 1;
+        }
+        txn.commit().await?;
+    }
+    Ok(ApiResponse::ok(InsertCollectionsResponse { inserted, skipped }))
+}
+
+/// 合集详情必须与请求的 UP 主一致，避免把别的 UP 主的 sid 存进来
+fn ensure_matching_upper(info: &CollectionInfo, mid: i64) -> Result<(), ApiError> {
+    if info.mid != mid {
+        return Err(InnerApiError::BadRequest("合集不属于该 UP 主，请重新扫描".to_string()).into());
+    }
+    Ok(())
 }
 
 /// 新增投稿订阅

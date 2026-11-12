@@ -319,6 +319,32 @@ pub struct VideoSourcesDetailsResponse {
     pub watch_later: Vec<VideoSourceDetail>,
 }
 
+/// 扫描 UP 主得到的合集条目，subscribed 表示已经在视频源里
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannedCollection {
+    pub sid: i64,
+    pub collection_type: i32,
+    pub name: String,
+    pub cover: String,
+    pub total: i64,
+    pub subscribed: bool,
+}
+
+#[derive(Serialize)]
+pub struct ScannedCollectionsResponse {
+    pub collections: Vec<ScannedCollection>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertCollectionsResponse {
+    /// 实际新增的合集数量
+    pub inserted: usize,
+    /// 因为已存在而跳过的数量
+    pub skipped: usize,
+}
+
 #[derive(Serialize, FromQueryResult)]
 pub struct DayCountPair {
     pub day: String,

@@ -41,6 +41,29 @@ pub struct VideosRequest {
 #[derive(Deserialize)]
 pub struct ScanDeletedVideosRequest {
     pub submission_ids: Option<Vec<i32>>,
+    #[serde(default)]
+    pub collection_ids: Option<Vec<i32>>,
+}
+
+/// 扫描指定 UP 主名下的合集与列表
+#[derive(Deserialize)]
+pub struct ScanUpperCollectionsRequest {
+    pub upper_id: i64,
+}
+
+/// 批量订阅扫描出来的合集
+#[derive(Deserialize, Validate)]
+pub struct InsertCollectionsRequest {
+    pub mid: i64,
+    pub items: Vec<InsertCollectionItem>,
+    #[validate(custom(function = "crate::utils::validation::validate_path"))]
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct InsertCollectionItem {
+    pub sid: i64,
+    pub collection_type: CollectionType,
 }
 
 #[derive(Deserialize)]

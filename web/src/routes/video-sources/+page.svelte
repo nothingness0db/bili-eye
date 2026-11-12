@@ -17,6 +17,7 @@
 	import InfoIcon from '@lucide/svelte/icons/info';
 	import PlusIcon from '@lucide/svelte/icons/plus';
 	import RefreshCwIcon from '@lucide/svelte/icons/refresh-cw';
+	import SearchIcon from '@lucide/svelte/icons/search';
 	import SquarePenIcon from '@lucide/svelte/icons/square-pen';
 	import Trash2Icon from '@lucide/svelte/icons/trash-2';
 	import UserIcon from '@lucide/svelte/icons/user';
@@ -26,6 +27,7 @@
 	import type {
 		ApiError,
 		FilterOption,
+		ScannedCollection,
 		VideoSourceDetail,
 		VideoSourcesDetailsResponse,
 		Rule
@@ -45,6 +47,15 @@
 	let showAddDialog = false;
 	let addDialogType: 'favorites' | 'collections' | 'submissions' = 'favorites';
 	let adding = false;
+
+	// 扫描合集对话框状态
+	let showScanDialog = false;
+	let scanUpperId = '';
+	let scanning = false;
+	let scannedCollections: ScannedCollection[] = [];
+	let selectedSids: number[] = [];
+	let scanPath = '';
+	let insertingScanned = false;
 
 	// 编辑对话框状态
 	let showEditDialog = false;
@@ -287,6 +298,81 @@
 		showAddDialog = true;
 	}
 
+	// 打开扫描合集对话框
+	function openScanDialog() {
+		scanUpperId = '';
+		scanPath = '';
+		scannedCollections = [];
+		selectedSids = [];
+		showScanDialog = true;
+	}
+
+	async function handleScanCollections() {
+		const upperId = parseInt(scanUpperId);
+		if (!scanUpperId || Number.isNaN(upperId)) {
+			toast.error('请填写 UP 主 UID');
+			return;
+		}
+		scanning = true;
+		try {
+			const response = await api.scanUpperCollections(upperId);
+			scannedCollections = response.data.collections;
+			selectedSids = scannedCollections.filter((c) => !c.subscribed).map((c) => c.sid);
+			if (scannedCollections.length === 0) {
+				toast.info('该 UP 主没有合集或列表');
+			}
+		} catch (error) {
+			// 扫描失败时清空上一次的结果，避免误把旧列表当成这个 UP 主的合集
+			scannedCollections = [];
+			selectedSids = [];
+			toast.error('扫描失败', {
+				description: (error as ApiError).message
+			});
+		} finally {
+			scanning = false;
+		}
+	}
+
+	function toggleScanned(sid: number, checked: boolean) {
+		selectedSids = checked
+			? [...selectedSids.filter((s) => s !== sid), sid]
+			: selectedSids.filter((s) => s !== sid);
+	}
+
+	async function handleInsertScanned() {
+		if (selectedSids.length === 0) {
+			toast.warning('请至少选择一个合集');
+			return;
+		}
+		if (!scanPath.trim()) {
+			toast.error('请填写下载路径');
+			return;
+		}
+		const upperId = parseInt(scanUpperId);
+		const items = scannedCollections
+			.filter((c) => selectedSids.includes(c.sid))
+			.map((c) => ({ sid: c.sid, collection_type: c.collectionType }));
+		insertingScanned = true;
+		try {
+			const response = await api.insertCollections({
+				mid: upperId,
+				items,
+				path: scanPath
+			});
+			toast.success('添加完成', {
+				description: `新增 ${response.data.inserted} 个，跳过 ${response.data.skipped} 个已存在的合集`
+			});
+			showScanDialog = false;
+			loadVideoSources();
+		} catch (error) {
+			toast.error('添加失败', {
+				description: (error as ApiError).message
+			});
+		} finally {
+			insertingScanned = false;
+		}
+	}
+
 	// 处理添加
 	async function handleAdd() {
 		adding = true;
@@ -368,12 +454,29 @@
 				<Tabs.Content value={key} class="mt-6">
 					<div class="mb-4 flex items-center justify-between">
 						<div></div>
-						{#if key === 'favorites' || key === 'collections' || key === 'submissions'}
-							<Button size="sm" onclick={() => openAddDialog(key)} class="flex items-center gap-2">
-								<PlusIcon class="h-4 w-4" />
-								手动添加
-							</Button>
-						{/if}
+						<div class="flex items-center gap-2">
+							{#if key === 'collections'}
+								<Button
+									size="sm"
+									variant="outline"
+									onclick={openScanDialog}
+									class="flex items-center gap-2"
+								>
+									<SearchIcon class="h-4 w-4" />
+									扫描合集
+								</Button>
+							{/if}
+							{#if key === 'favorites' || key === 'collections' || key === 'submissions'}
+								<Button
+									size="sm"
+									onclick={() => openAddDialog(key)}
+									class="flex items-center gap-2"
+								>
+									<PlusIcon class="h-4 w-4" />
+									手动添加
+								</Button>
+							{/if}
+						</div>
 					</div>
 					{#if sources.length > 0}
 						<div class="overflow-x-auto">
@@ -848,6 +951,87 @@
 				</Button>
 				<Button onclick={handleAdd} disabled={adding} class="px-4">
 					{adding ? '添加中...' : '添加'}
+				</Button>
+			</div>
+		</Dialog.Content>
+	</Dialog.Root>
+
+	<Dialog.Root bind:open={showScanDialog}>
+		<Dialog.Content class="max-w-2xl">
+			<Dialog.Header>
+				<Dialog.Title>扫描 UP 主的合集</Dialog.Title>
+				<Dialog.Description>
+					输入 UID 拉取该 UP 主名下的全部合集与列表，勾选后批量添加。已订阅的条目会标记出来。
+				</Dialog.Description>
+			</Dialog.Header>
+			<div class="space-y-4 py-2">
+				<div class="flex items-end gap-2">
+					<div class="flex-1 space-y-2">
+						<Label for="scan-upper-id">UP 主 UID</Label>
+						<Input
+							id="scan-upper-id"
+							bind:value={scanUpperId}
+							placeholder="例如 521722088"
+							disabled={scanning}
+						/>
+					</div>
+					<Button onclick={handleScanCollections} disabled={scanning} class="px-4">
+						{scanning ? '扫描中...' : '扫描'}
+					</Button>
+				</div>
+
+				{#if scannedCollections.length > 0}
+					<div class="max-h-72 space-y-1 overflow-y-auto rounded-md border p-2">
+						{#each scannedCollections as collection (collection.sid)}
+							<label
+								class="hover:bg-accent/50 flex cursor-pointer items-center gap-2 rounded px-2 py-1.5"
+							>
+								<Checkbox
+									checked={selectedSids.includes(collection.sid)}
+									disabled={collection.subscribed}
+									onCheckedChange={(checked) => toggleScanned(collection.sid, checked)}
+								/>
+								<span class="truncate text-sm">{collection.name}</span>
+								<Badge variant="secondary" class="shrink-0 text-xs">
+									{collection.collectionType === 1 ? '列表' : '合集'}
+								</Badge>
+								<span class="text-muted-foreground shrink-0 text-xs">
+									{collection.total} 个视频
+								</span>
+								{#if collection.subscribed}
+									<Badge variant="outline" class="shrink-0 text-xs">已订阅</Badge>
+								{/if}
+							</label>
+						{/each}
+					</div>
+					<div class="space-y-2">
+						<Label for="scan-path">下载路径</Label>
+						<Input
+							id="scan-path"
+							bind:value={scanPath}
+							placeholder="/app/data/合集名称"
+							disabled={insertingScanned}
+						/>
+					</div>
+				{/if}
+			</div>
+			<div class="flex justify-end gap-2 pt-2">
+				<Button
+					variant="outline"
+					onclick={() => {
+						showScanDialog = false;
+					}}
+					disabled={insertingScanned}
+					class="px-4"
+				>
+					取消
+				</Button>
+				<Button
+					onclick={handleInsertScanned}
+					disabled={insertingScanned || selectedSids.length === 0}
+					class="px-4"
+				>
+					{insertingScanned ? '添加中...' : `添加所选（${selectedSids.length}）`}
 				</Button>
 			</div>
 		</Dialog.Content>

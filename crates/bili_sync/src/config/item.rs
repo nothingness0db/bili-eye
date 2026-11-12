@@ -88,13 +88,16 @@ pub struct DanmakuUpdatePolicy {
     pub milestones: Vec<DanmakuUpdateMilestone>,
 }
 
-/// 自动检查删除失效的配置：按固定间隔对所选投稿源执行删除检测
+/// 自动检查删除失效的配置：按固定间隔对所选视频源执行删除检测
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct AutoDeleteScanPolicy {
     pub enabled: bool,
     /// 要检查的投稿源 id；为空表示检查全部启用的投稿源
     #[serde(default)]
     pub submission_ids: Vec<i32>,
+    /// 要检查的合集源 id；为空表示检查全部启用的合集源
+    #[serde(default)]
+    pub collection_ids: Vec<i32>,
     /// 两次检查的最小间隔（小时）
     #[serde(default)]
     pub interval_hours: u32,

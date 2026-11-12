@@ -199,16 +199,18 @@ pub async fn get_video(
 }
 
 /// 手动指定的源逐个检查，不受周期同步的启用开关限制；省略选择时只检查启用源。
+/// 投稿源与合集源分别按各自的 id 选择，两者可以同时参与同一轮检测；
+/// 只要显式指定了其中一类，另一类就不会被默认展开成全部启用源。
 async fn scan_sources_for_selection(
     db: &DatabaseConnection,
-    requested: Option<&[i32]>,
-) -> Result<Vec<submission::Model>, ApiError> {
-    let sources = match requested {
+    submission_ids: Option<&[i32]>,
+    collection_ids: Option<&[i32]>,
+) -> Result<Vec<VideoSourceEnum>, ApiError> {
+    let explicit = submission_ids.is_some() || collection_ids.is_some();
+    let mut sources = Vec::new();
+    let submissions = match submission_ids {
         Some(ids) => {
-            let ids = ids.iter().copied().collect::<HashSet<_>>();
-            if ids.is_empty() {
-                return Err(InnerApiError::BadRequest("请至少选择一个投稿源".to_string()).into());
-            }
+            let ids = checked_selection(ids, "投稿源")?;
             let sources = submission::Entity::find()
                 .filter(submission::Column::Id.is_in(ids.iter().copied()))
                 .order_by_asc(submission::Column::Id)
@@ -219,6 +221,7 @@ async fn scan_sources_for_selection(
             }
             sources
         }
+        None if explicit => Vec::new(),
         None => {
             submission::Entity::find()
                 .filter(submission::Column::Enabled.eq(true))
@@ -227,16 +230,48 @@ async fn scan_sources_for_selection(
                 .await?
         }
     };
+    sources.extend(submissions.into_iter().map(VideoSourceEnum::from));
+    let collections = match collection_ids {
+        Some(ids) => {
+            let ids = checked_selection(ids, "合集源")?;
+            let sources = collection::Entity::find()
+                .filter(collection::Column::Id.is_in(ids.iter().copied()))
+                .order_by_asc(collection::Column::Id)
+                .all(db)
+                .await?;
+            if sources.len() != ids.len() {
+                return Err(InnerApiError::BadRequest("部分所选合集源已不存在，请刷新后重新选择".to_string()).into());
+            }
+            sources
+        }
+        None if explicit => Vec::new(),
+        None => {
+            collection::Entity::find()
+                .filter(collection::Column::Enabled.eq(true))
+                .order_by_asc(collection::Column::Id)
+                .all(db)
+                .await?
+        }
+    };
+    sources.extend(collections.into_iter().map(VideoSourceEnum::from));
     if sources.is_empty() {
-        return Err(InnerApiError::BadRequest("没有可检查的投稿源".to_string()).into());
+        return Err(InnerApiError::BadRequest("没有可检查的视频源".to_string()).into());
     }
     Ok(sources)
+}
+
+fn checked_selection(ids: &[i32], kind: &str) -> Result<HashSet<i32>, ApiError> {
+    let ids = ids.iter().copied().collect::<HashSet<_>>();
+    if ids.is_empty() {
+        return Err(InnerApiError::BadRequest(format!("请至少选择一个{}", kind)).into());
+    }
+    Ok(ids)
 }
 
 /// 执行删除检测：等待当前视频任务结束后逐源检查，风控时提前终止本轮。
 /// trigger 用于日志区分手动/自动触发；调用方需持有 SCAN_DEAD_LOCK 防止并发。
 pub(crate) async fn execute_delete_scan(
-    sources: Vec<submission::Model>,
+    sources: Vec<VideoSourceEnum>,
     bili_client: Arc<BiliClient>,
     connection: DatabaseConnection,
     trigger: &str,
@@ -260,8 +295,7 @@ pub(crate) async fn execute_delete_scan(
     };
     let config = VersionedConfig::get().read();
     let (mut scanned, mut deleted, mut restored) = (0, 0, 0);
-    for (idx, source) in sources.into_iter().enumerate() {
-        let video_source: VideoSourceEnum = source.into();
+    for (idx, video_source) in sources.into_iter().enumerate() {
         {
             let mut progress = SCAN_TASK_PROGRESS.write();
             progress.current = idx + 1;
@@ -297,7 +331,7 @@ pub(crate) async fn execute_delete_scan(
         }
     }
     info!(
-        "{}删除检测完成：扫描 {} 个投稿源，新标记删除 {} 个，恢复有效 {} 个",
+        "{}删除检测完成：扫描 {} 个视频源，新标记删除 {} 个，恢复有效 {} 个",
         trigger, scanned, deleted, restored
     );
     *SCAN_TASK_PROGRESS.write() = ScanTaskProgress::default();
@@ -310,7 +344,12 @@ pub async fn scan_deleted_videos(
     Extension(bili_client): Extension<Arc<BiliClient>>,
     Json(request): Json<ScanDeletedVideosRequest>,
 ) -> Result<ApiResponse<ScanDeletedVideosResponse>, ApiError> {
-    let sources = scan_sources_for_selection(&db, request.submission_ids.as_deref()).await?;
+    let sources = scan_sources_for_selection(
+        &db,
+        request.submission_ids.as_deref(),
+        request.collection_ids.as_deref(),
+    )
+    .await?;
     // 防连点：已有检测在跑（含排队等待中）时直接拒绝。
     let dedup_guard = SCAN_DEAD_LOCK
         .try_lock()
@@ -356,14 +395,16 @@ pub async fn auto_delete_scan_worker(connection: DatabaseConnection, bili_client
         };
         let requested = (!config.auto_delete_scan.submission_ids.is_empty())
             .then_some(config.auto_delete_scan.submission_ids.as_slice());
-        let Ok(sources) = scan_sources_for_selection(&connection, requested).await else {
+        let requested_collections = (!config.auto_delete_scan.collection_ids.is_empty())
+            .then_some(config.auto_delete_scan.collection_ids.as_slice());
+        let Ok(sources) = scan_sources_for_selection(&connection, requested, requested_collections).await else {
             continue;
         };
         if sources.is_empty() {
             continue;
         }
         info!(
-            "自动删除检测：到期待检投稿源 {} 个，排队等当前视频任务结束",
+            "自动删除检测：到期待检视频源 {} 个，排队等当前视频任务结束",
             sources.len()
         );
         // 运行前先记录时间，保证无论本轮结果如何都按完整间隔等待
@@ -706,10 +747,11 @@ pub async fn update_filtered_video_status(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use axum::response::IntoResponse;
     use bili_sync_migration::{Migrator, MigratorTrait};
     use sea_orm::Database;
+
+    use super::*;
 
     async fn reset_fixture(video_status: u32, page_statuses: &[u32]) -> Result<DatabaseConnection> {
         let db = Database::connect("sqlite::memory:").await?;
@@ -881,24 +923,92 @@ mod tests {
             .insert(&db)
             .await?;
         }
-        let paused = scan_sources_for_selection(&db, Some(&[2]))
+        let paused = scan_sources_for_selection(&db, Some(&[2]), None)
             .await
             .unwrap_or_else(|_| panic!("explicitly selected paused sources must be checked"));
-        assert_eq!(paused.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!(names_of(&paused), vec!["「source-2」投稿".to_string()]);
         assert!(!submission::Entity::find_by_id(2).one(&db).await?.unwrap().enabled);
-        let default = scan_sources_for_selection(&db, None)
+        let default = scan_sources_for_selection(&db, None, None)
             .await
             .unwrap_or_else(|_| panic!("default selection should include enabled sources"));
-        assert_eq!(default.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1]);
-        let selected = scan_sources_for_selection(&db, Some(&[2, 1, 2]))
+        assert_eq!(names_of(&default), vec!["「source-1」投稿".to_string()]);
+        let selected = scan_sources_for_selection(&db, Some(&[2, 1, 2]), None)
             .await
             .unwrap_or_else(|_| panic!("duplicate source IDs should be deduplicated"));
-        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 2]);
-        let error = scan_sources_for_selection(&db, Some(&[1, 999]))
+        assert_eq!(
+            names_of(&selected),
+            vec!["「source-1」投稿".to_string(), "「source-2」投稿".to_string()]
+        );
+        let error = scan_sources_for_selection(&db, Some(&[1, 999]), None)
             .await
             .err()
             .expect("stale selections must not silently run a partial scan");
         assert_eq!(error.into_response().status(), axum::http::StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    fn names_of(sources: &[VideoSourceEnum]) -> Vec<String> {
+        sources.iter().map(|s| s.display_name().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn collection_sources_join_deleted_scan_selection() -> Result<()> {
+        let db = Database::connect("sqlite::memory:").await?;
+        Migrator::up(&db, None).await?;
+        for (id, enabled) in [(1, true), (2, false)] {
+            collection::ActiveModel {
+                id: Set(id),
+                s_id: Set(i64::from(id)),
+                m_id: Set(100),
+                name: Set(format!("合集-{id}")),
+                r#type: Set(2),
+                path: Set(format!("/test/collection-{id}")),
+                enabled: Set(enabled),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await?;
+        }
+        submission::ActiveModel {
+            id: Set(1),
+            upper_id: Set(1),
+            upper_name: Set("source-1".into()),
+            path: Set("/test/source-1".into()),
+            created_at: Set(String::new()),
+            latest_row_at: Set(chrono::Utc::now().naive_utc()),
+            use_dynamic_api: Set(false),
+            enabled: Set(true),
+            rule: Set(None),
+            filter_option: Set(None),
+        }
+        .insert(&db)
+        .await?;
+        // 显式只选投稿源时不应顺带启用全部合集源
+        let submissions_only = scan_sources_for_selection(&db, Some(&[1]), None)
+            .await
+            .unwrap_or_else(|_| panic!("explicit submission selection should succeed"));
+        assert!(
+            submissions_only
+                .iter()
+                .all(|s| !matches!(s, VideoSourceEnum::Collection(_)))
+        );
+
+        // 显式选择合集源时必须能拿到暂停中的合集，且不会被启用
+        let selected = scan_sources_for_selection(&db, None, Some(&[2]))
+            .await
+            .unwrap_or_else(|_| panic!("explicitly selected paused collections must be checked"));
+        assert_eq!(names_of(&selected), vec!["合集「合集-2」".to_string()]);
+        assert!(!collection::Entity::find_by_id(2).one(&db).await?.unwrap().enabled);
+
+        // 省略选择时投稿与合集都只取启用源
+        let default = scan_sources_for_selection(&db, None, None)
+            .await
+            .unwrap_or_else(|_| panic!("default selection should include enabled sources"));
+        assert!(
+            default
+                .iter()
+                .any(|s| matches!(s, VideoSourceEnum::Collection(c) if c.id == 1))
+        );
         Ok(())
     }
 
@@ -911,6 +1021,7 @@ mod tests {
             Extension(Arc::new(BiliClient::new())),
             Json(ScanDeletedVideosRequest {
                 submission_ids: Some(vec![]),
+                collection_ids: None,
             }),
         )
         .await;

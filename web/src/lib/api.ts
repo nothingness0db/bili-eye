@@ -15,6 +15,8 @@ import type {
 	FullSyncVideoSourceResponse,
 	QrcodeGenerateResponse as GenerateQrcodeResponse,
 	InsertCollectionRequest,
+	InsertCollectionsRequest,
+	InsertCollectionsResponse,
 	InsertDynamicSourceRequest,
 	InsertFavoriteRequest,
 	InsertSubmissionRequest,
@@ -25,6 +27,7 @@ import type {
 	ResetVideoResponse,
 	ResetVideoStatusRequest,
 	ScanDeletedVideosResponse,
+	ScannedCollectionsResponse,
 	SysInfo,
 	TaskBoardResponse,
 	TaskStatus,
@@ -344,6 +347,18 @@ class ApiClient {
 		return this.post<boolean>('/video-sources/collections', request);
 	}
 
+	async scanUpperCollections(upperId: number): Promise<ApiResponse<ScannedCollectionsResponse>> {
+		return this.post<ScannedCollectionsResponse>('/video-sources/collections/scan', {
+			upper_id: upperId
+		});
+	}
+
+	async insertCollections(
+		request: InsertCollectionsRequest
+	): Promise<ApiResponse<InsertCollectionsResponse>> {
+		return this.post<InsertCollectionsResponse>('/video-sources/collections/batch', request);
+	}
+
 	async insertSubmission(request: InsertSubmissionRequest): Promise<ApiResponse<boolean>> {
 		return this.post<boolean>('/video-sources/submissions', request);
 	}
@@ -469,6 +484,8 @@ const api = {
 		apiClient.getFollowedUppers(pageNum, pageSize, name),
 	insertFavorite: (request: InsertFavoriteRequest) => apiClient.insertFavorite(request),
 	insertCollection: (request: InsertCollectionRequest) => apiClient.insertCollection(request),
+	scanUpperCollections: (upperId: number) => apiClient.scanUpperCollections(upperId),
+	insertCollections: (request: InsertCollectionsRequest) => apiClient.insertCollections(request),
 	insertSubmission: (request: InsertSubmissionRequest) => apiClient.insertSubmission(request),
 	getVideoSourcesDetails: () => apiClient.getVideoSourcesDetails(),
 	updateVideoSource: (type: string, id: number, request: UpdateVideoSourceRequest) =>

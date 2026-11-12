@@ -214,6 +214,35 @@ export interface InsertCollectionRequest {
 	path: string;
 }
 
+export interface ScannedCollection {
+	sid: number;
+	collectionType: number;
+	name: string;
+	cover: string;
+	total: number;
+	subscribed: boolean;
+}
+
+export interface ScannedCollectionsResponse {
+	collections: ScannedCollection[];
+}
+
+export interface InsertCollectionItem {
+	sid: number;
+	collection_type: number;
+}
+
+export interface InsertCollectionsRequest {
+	mid: number;
+	items: InsertCollectionItem[];
+	path: string;
+}
+
+export interface InsertCollectionsResponse {
+	inserted: number;
+	skipped: number;
+}
+
 export interface InsertSubmissionRequest {
 	upper_id: number;
 	path: string;

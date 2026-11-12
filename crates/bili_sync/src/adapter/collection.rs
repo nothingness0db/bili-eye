@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -6,7 +7,7 @@ use anyhow::{Result, ensure};
 use bili_sync_entity::rule::Rule;
 use bili_sync_entity::*;
 use chrono::Utc;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use sea_orm::ActiveValue::Set;
 use sea_orm::entity::prelude::*;
 use sea_orm::sea_query::SimpleExpr;
@@ -100,6 +101,34 @@ impl VideoSource for collection::Model {
         .update(connection)
         .await?;
         Ok((updated_model.into(), Box::pin(collection.into_video_stream())))
+    }
+
+    /// 合集的分页顺序不保证稳定，必须翻完全部页面才能得到完整成员列表。
+    async fn collect_current_bvids(
+        &self,
+        bili_client: &BiliClient,
+        credential: &Credential,
+    ) -> Result<HashSet<String>> {
+        let collection = Collection::new(
+            bili_client,
+            CollectionItem {
+                sid: self.s_id.to_string(),
+                mid: self.m_id.to_string(),
+                collection_type: CollectionType::from_expected(self.r#type),
+            },
+            credential,
+        );
+        let mut bvids = HashSet::new();
+        let mut stream = Box::pin(collection.into_video_stream());
+        while let Some(res) = stream.next().await {
+            let VideoInfo::Collection { bvid, .. } = res? else {
+                unreachable!("collection stream should only yield Collection variant")
+            };
+            bvids.insert(bvid);
+            // 合集列表接口与投稿列表同为风控敏感接口，逐个视频保持低频（与投稿源实现一致）
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+        Ok(bvids)
     }
 
     async fn delete_from_db(self, conn: &impl ConnectionTrait) -> Result<()> {

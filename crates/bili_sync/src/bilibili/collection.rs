@@ -70,6 +70,56 @@ pub struct CollectionItem {
     pub collection_type: CollectionType,
 }
 
+/// UP 主名下的一个合集/列表条目，用于扫描后选择订阅
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpperCollection {
+    pub sid: i64,
+    pub collection_type: CollectionType,
+    pub name: String,
+    pub cover: String,
+    pub total: i64,
+}
+
+impl<'de> Deserialize<'de> for UpperCollection {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct UpperCollectionRaw {
+            meta: CollectionMeta,
+        }
+        #[derive(Deserialize)]
+        struct CollectionMeta {
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            title: String,
+            #[serde(default)]
+            cover: String,
+            #[serde(default)]
+            total: i64,
+            season_id: Option<i64>,
+            series_id: Option<i64>,
+        }
+        let UpperCollectionRaw { meta } = UpperCollectionRaw::deserialize(deserializer)?;
+        let (sid, collection_type) = match (meta.season_id, meta.series_id) {
+            (Some(sid), None) => (sid, CollectionType::Season),
+            (None, Some(sid)) => (sid, CollectionType::Series),
+            _ => return Err(serde::de::Error::custom("invalid upper collection meta")),
+        };
+        // season 的 meta.name 带「合集·」前缀，title 是干净标题；series 只有 name
+        let name = if meta.name.is_empty() { meta.title } else { meta.name };
+        Ok(UpperCollection {
+            sid,
+            collection_type,
+            name,
+            cover: meta.cover,
+            total: meta.total,
+        })
+    }
+}
+
 pub struct Collection<'a> {
     client: &'a BiliClient,
     pub collection: CollectionItem,
@@ -127,6 +177,65 @@ impl<'a> Collection<'a> {
             CollectionType::Series => self.get_series_info().await?["data"]["meta"].take(),
         };
         Ok(serde_json::from_value(meta)?)
+    }
+
+    /// 拉取 UP 主名下的全部合集与列表，供页面扫描后勾选订阅
+    pub async fn list_by_upper(
+        client: &'a BiliClient,
+        credential: &'a Credential,
+        mid: &str,
+    ) -> Result<Vec<UpperCollection>> {
+        let mut page = 1;
+        let mut result = Vec::new();
+        loop {
+            let res = client
+                .request(
+                    Method::GET,
+                    "https://api.bilibili.com/x/polymer/web-space/seasons_series_list",
+                    credential,
+                )
+                .await
+                .query(&[("mid", mid), ("page_num", &page.to_string()), ("page_size", "20")])
+                .send()
+                .await?
+                .error_for_status_ext()?
+                .json::<Value>()
+                .await?
+                .validate()?;
+            let lists = &res["data"]["items_lists"];
+            let mut got = 0usize;
+            for key in ["seasons_list", "series_list"] {
+                let Some(items) = lists[key].as_array() else {
+                    continue;
+                };
+                got += items.len();
+                for item in items {
+                    match serde_json::from_value::<UpperCollection>(item.clone()) {
+                        Ok(collection) => result.push(collection),
+                        Err(e) => {
+                            return Err(anyhow!("failed to parse collection of mid {}: {}", mid, e));
+                        }
+                    }
+                }
+            }
+            let page_info = &lists["page"];
+            let (Some(num), Some(size), Some(total)) = (
+                page_info["page_num"].as_i64(),
+                page_info["page_size"].as_i64(),
+                page_info["total"].as_i64(),
+            ) else {
+                return Err(anyhow!(
+                    "invalid page info when listing collections of mid {}: read {}",
+                    mid,
+                    page_info
+                ));
+            };
+            if got == 0 || num * size >= total {
+                break;
+            }
+            page += 1;
+        }
+        Ok(result)
     }
 
     async fn get_series_info(&self) -> Result<Value> {
