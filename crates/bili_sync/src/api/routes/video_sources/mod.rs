@@ -553,7 +553,11 @@ pub async fn scan_upper_collections(
     Ok(ApiResponse::ok(ScannedCollectionsResponse { collections }))
 }
 
-/// 批量订阅扫描出来的合集，已存在的条目直接跳过
+/// 批量订阅扫描出来的合集，已存在的条目直接跳过。
+///
+/// 注意：这里只登记合集本身，不会扫描本地已下载的文件。
+/// 本地存在但库里没有记录的视频需要靠后续同步重新抓取录入，
+/// 「扫描本地文件直接入库」属于已知未实现项，详见 Collection::list_by_upper 的说明。
 pub async fn insert_collections(
     Extension(db): Extension<DatabaseConnection>,
     Extension(bili_client): Extension<Arc<BiliClient>>,

@@ -963,6 +963,9 @@
 				<Dialog.Description>
 					输入 UID 拉取该 UP 主名下的全部合集与列表，勾选后批量添加。已订阅的条目会标记出来。
 				</Dialog.Description>
+				<p class="text-muted-foreground text-xs">
+					注意：这里只登记合集本身，不会扫描本地已下载的文件。磁盘上已存在但库里没有记录的视频不会被识别，需要靠后续同步重新抓取入库。
+				</p>
 			</Dialog.Header>
 			<div class="space-y-4 py-2">
 				<div class="flex items-end gap-2">
